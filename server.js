@@ -50,6 +50,8 @@ if (SELF_URL) {
 // sessions: sessionToken -> { roomCode, userId }
 const rooms = new Map();
 const sessions = new Map();
+// suggestions: suggestionId -> { roomCode, fromUserId, fromUsername, trackInfo }
+const suggestions = new Map();
 
 // Give every connected socket an id we can look up later
 function attach(ws, userId, roomCode) {
@@ -157,6 +159,9 @@ function handleMessage(ws, type, payload) {
     case 'request_sync': return onRequestSync(ws);
     case 'reconnect': return onReconnect(ws, payload);
     case 'chat': return onChat(ws, payload);
+    case 'suggest_track': return onSuggestTrack(ws, payload);
+    case 'approve_suggestion': return onApproveSuggestion(ws, payload);
+    case 'reject_suggestion': return onRejectSuggestion(ws, payload);
     case 'ping': return send(ws, 'pong', {});
     default:
       send(ws, 'error', { code: 'UNKNOWN_TYPE', message: `Unknown type: ${type}` });
@@ -352,6 +357,76 @@ function onChat(ws, payload) {
   });
 }
 
+function onSuggestTrack(ws, payload) {
+  const room = rooms.get(ws.roomCode);
+  if (!room) return;
+  if (ws.userId === room.hostId) return; // host doesn't suggest to itself
+
+  const suggester = room.users.find(u => u.userId === ws.userId);
+  if (!suggester || !payload.track_info) return;
+
+  const suggestionId = uuidv4();
+  suggestions.set(suggestionId, {
+    roomCode: room.roomCode,
+    fromUserId: ws.userId,
+    fromUsername: suggester.username,
+    trackInfo: payload.track_info,
+  });
+
+  const host = room.users.find(u => u.userId === room.hostId);
+  if (host && host.socket) {
+    send(host.socket, 'suggestion_received', {
+      suggestion_id: suggestionId,
+      from_user_id: ws.userId,
+      from_username: suggester.username,
+      track_info: payload.track_info,
+    });
+  }
+}
+
+function onApproveSuggestion(ws, payload) {
+  const room = rooms.get(ws.roomCode);
+  if (!room || room.hostId !== ws.userId) return; // only host approves
+
+  const suggestion = suggestions.get(payload.suggestion_id);
+  if (!suggestion || suggestion.roomCode !== room.roomCode) return;
+  suggestions.delete(payload.suggestion_id);
+
+  // Add the suggested track to the queue
+  room.queue.push(suggestion.trackInfo);
+  room.lastUpdate = Date.now();
+
+  broadcast(room, 'suggestion_approved', {
+    suggestion_id: payload.suggestion_id,
+    track_info: suggestion.trackInfo,
+  });
+  send(ws, 'suggestion_approved', {
+    suggestion_id: payload.suggestion_id,
+    track_info: suggestion.trackInfo,
+  });
+
+  // Let everyone know the queue changed too
+  broadcast(room, 'sync_playback', {
+    action: 'queue_add',
+    track_info: suggestion.trackInfo,
+    server_time: Date.now(),
+  }, ws.userId);
+}
+
+function onRejectSuggestion(ws, payload) {
+  const room = rooms.get(ws.roomCode);
+  if (!room || room.hostId !== ws.userId) return; // only host rejects
+
+  const suggestion = suggestions.get(payload.suggestion_id);
+  if (!suggestion || suggestion.roomCode !== room.roomCode) return;
+  suggestions.delete(payload.suggestion_id);
+
+  const reasonPayload = { suggestion_id: payload.suggestion_id, reason: payload.reason || 'Rejected by host' };
+
+  broadcast(room, 'suggestion_rejected', reasonPayload);
+  send(ws, 'suggestion_rejected', reasonPayload);
+}
+
 function onLeaveRoom(ws) {
   const room = rooms.get(ws.roomCode);
   if (!room) return;
@@ -380,6 +455,9 @@ function cleanupRoomIfEmpty(room) {
       const still = rooms.get(room.roomCode);
       if (still && !still.users.some(u => u.isConnected)) {
         rooms.delete(room.roomCode);
+        for (const [id, s] of suggestions) {
+          if (s.roomCode === room.roomCode) suggestions.delete(id);
+        }
         console.log(`Room ${room.roomCode} cleaned up (empty).`);
       }
     }, 5 * 60 * 1000); // 5 min grace period
