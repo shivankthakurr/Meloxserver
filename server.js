@@ -145,6 +145,27 @@ setInterval(() => {
   });
 }, 30000);
 
+// Expire rooms that were created but never joined by a guest within 15 min.
+// Rooms that a guest has ever joined (hasBeenJoined) are never auto-expired
+// this way — they only clean up via the empty-room grace period below.
+const ROOM_JOIN_EXPIRY_MS = 15 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const room of rooms.values()) {
+    if (!room.hasBeenJoined && (now - room.createdAt) >= ROOM_JOIN_EXPIRY_MS) {
+      const host = room.users.find(u => u.userId === room.hostId);
+      if (host && host.socket) {
+        send(host.socket, 'room_expired', { room_code: room.roomCode, reason: 'No one joined within 15 minutes' });
+      }
+      rooms.delete(room.roomCode);
+      for (const [id, s] of suggestions) {
+        if (s.roomCode === room.roomCode) suggestions.delete(id);
+      }
+      console.log(`Room ${room.roomCode} expired (unused for 15+ min).`);
+    }
+  }
+}, 60 * 1000); // check every minute
+
 // ---- Message router --------------------------------------------------
 function handleMessage(ws, type, payload) {
   switch (type) {
@@ -154,6 +175,7 @@ function handleMessage(ws, type, payload) {
     case 'approve_join': return onApproveJoin(ws, payload);
     case 'reject_join': return onRejectJoin(ws, payload);
     case 'playback_action': return onPlaybackAction(ws, payload);
+    case 'buffer_ready': return onBufferReady(ws, payload);
     case 'kick_user': return onKickUser(ws, payload);
     case 'transfer_host': return onTransferHost(ws, payload);
     case 'request_sync': return onRequestSync(ws);
@@ -184,6 +206,12 @@ function onCreateRoom(ws, payload) {
     lastUpdate: Date.now(),
     volume: 1.0,
     queue: [],
+    hasBeenJoined: false, // becomes true forever once a guest is approved in — code is single-use
+    createdAt: Date.now(),
+    // buffer sync state (used while waiting for guests to buffer a newly changed track)
+    bufferTrackId: null,
+    bufferWaitingFor: null, // Set of userIds we're still waiting on
+    bufferTimeoutHandle: null,
   };
 
   rooms.set(roomCode, room);
@@ -193,9 +221,22 @@ function onCreateRoom(ws, payload) {
   send(ws, 'room_created', { room_code: roomCode, user_id: userId, session_token: sessionToken });
 }
 
+const MAX_ROOM_USERS = 2; // host + 1 guest
+
 function onJoinRoom(ws, payload) {
   const room = rooms.get((payload.room_code || '').toUpperCase());
   if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: 'Room does not exist' });
+
+  // One-time code: once a guest has ever been approved into this room, the
+  // code stops accepting fresh joins — even if that guest later disconnects
+  // or leaves. Reconnects use session tokens via `reconnect`, not this path.
+  if (room.hasBeenJoined) {
+    return send(ws, 'join_rejected', { reason: 'This room is no longer accepting new members' });
+  }
+
+  if (room.users.length >= MAX_ROOM_USERS) {
+    return send(ws, 'join_rejected', { reason: 'Room is full' });
+  }
 
   const userId = uuidv4();
   attach(ws, userId, room.roomCode);
@@ -223,6 +264,7 @@ function onApproveJoin(ws, payload) {
   const sessionToken = uuidv4();
   const user = { userId: payload.user_id, username: guestWs.pendingUsername, avatarIndex: guestWs.pendingAvatar || 0, isConnected: true, socket: guestWs };
   room.users.push(user);
+  room.hasBeenJoined = true; // code is now permanently used up, no new joins via join_room
   sessions.set(sessionToken, { roomCode: room.roomCode, userId: payload.user_id });
 
   send(guestWs, 'join_approved', {
@@ -264,6 +306,7 @@ function onPlaybackAction(ws, payload) {
       room.isPlaying = false;
       room.position = 0;
       if (payload.queue) room.queue = payload.queue;
+      startBufferWait(room, payload.track_info?.id || null);
       break;
     case 'queue_add':
       if (payload.track_info) {
@@ -287,6 +330,68 @@ function onPlaybackAction(ws, payload) {
   // Rebroadcast to everyone else, stamping our own server_time for
   // latency compensation on the receiving client.
   broadcast(room, 'sync_playback', { ...payload, server_time: now }, ws.userId);
+}
+
+const BUFFER_WAIT_TIMEOUT_MS = 10 * 1000; // don't let one slow guest freeze the room forever
+
+function startBufferWait(room, trackId) {
+  // Clear any previous pending wait (a new track change supersedes it)
+  if (room.bufferTimeoutHandle) {
+    clearTimeout(room.bufferTimeoutHandle);
+    room.bufferTimeoutHandle = null;
+  }
+
+  if (!trackId) {
+    room.bufferTrackId = null;
+    room.bufferWaitingFor = null;
+    return;
+  }
+
+  // Wait on every connected non-host user (guests) to confirm they've buffered
+  const waitingIds = room.users
+    .filter(u => u.userId !== room.hostId && u.isConnected)
+    .map(u => u.userId);
+
+  if (waitingIds.length === 0) {
+    // No guests to wait for — nothing to do
+    room.bufferTrackId = null;
+    room.bufferWaitingFor = null;
+    return;
+  }
+
+  room.bufferTrackId = trackId;
+  room.bufferWaitingFor = new Set(waitingIds);
+
+  broadcast(room, 'buffer_wait', { track_id: trackId, waiting_for: waitingIds });
+
+  room.bufferTimeoutHandle = setTimeout(() => {
+    if (room.bufferTrackId === trackId) {
+      console.log(`Room ${room.roomCode}: buffer wait timed out for track ${trackId}, forcing buffer_complete`);
+      finishBufferWait(room, trackId);
+    }
+  }, BUFFER_WAIT_TIMEOUT_MS);
+}
+
+function finishBufferWait(room, trackId) {
+  if (room.bufferTimeoutHandle) {
+    clearTimeout(room.bufferTimeoutHandle);
+    room.bufferTimeoutHandle = null;
+  }
+  room.bufferTrackId = null;
+  room.bufferWaitingFor = null;
+  broadcast(room, 'buffer_complete', { track_id: trackId });
+}
+
+function onBufferReady(ws, payload) {
+  const room = rooms.get(ws.roomCode);
+  if (!room) return;
+  if (!room.bufferWaitingFor || room.bufferTrackId !== payload.track_id) return; // stale/unknown wait
+
+  room.bufferWaitingFor.delete(ws.userId);
+
+  if (room.bufferWaitingFor.size === 0) {
+    finishBufferWait(room, payload.track_id);
+  }
 }
 
 function onKickUser(ws, payload) {
@@ -433,7 +538,18 @@ function onLeaveRoom(ws) {
   const user = room.users.find(u => u.userId === ws.userId);
   room.users = room.users.filter(u => u.userId !== ws.userId);
   broadcast(room, 'user_left', { user_id: ws.userId, username: user?.username });
+  releaseBufferWaitFor(room, ws.userId);
   cleanupRoomIfEmpty(room);
+}
+
+// If someone we were waiting on for buffering leaves/disconnects, don't let
+// the rest of the room hang until the timeout — release them immediately.
+function releaseBufferWaitFor(room, userId) {
+  if (!room.bufferWaitingFor || !room.bufferWaitingFor.has(userId)) return;
+  room.bufferWaitingFor.delete(userId);
+  if (room.bufferWaitingFor.size === 0) {
+    finishBufferWait(room, room.bufferTrackId);
+  }
 }
 
 function handleDisconnect(ws) {
@@ -444,6 +560,7 @@ function handleDisconnect(ws) {
     user.isConnected = false;
     broadcast(room, 'user_disconnected', { user_id: ws.userId, username: user.username }, ws.userId);
   }
+  releaseBufferWaitFor(room, ws.userId);
   cleanupRoomIfEmpty(room);
 }
 
